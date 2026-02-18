@@ -182,9 +182,10 @@ def _latest_mtime_recursive(directory: Path, pattern: str) -> float:
 
 CFG = _load_config()
 
-# Status thresholds
-THRESHOLD_SOON = 75
-THRESHOLD_IMMINENT = 90
+# Phase thresholds (percent of effective ceiling)
+PHASE_MIDSTREAM = 50
+PHASE_NARROWING = 80
+PHASE_THRESHOLD = 92
 
 # Sidecar state
 SIDECAR_DIR = Path(CFG.get("state_dir", "~/.claude")).expanduser()
@@ -662,9 +663,19 @@ def _empty_stats() -> dict:
     }
 
 
+# Session profile BPT values — tokenization rate varies by content mix.
+# Coding sessions have more JSON tool results (lower BPT), reading sessions
+# have more natural language (higher BPT). The balanced value splits the diff.
+BPT_PROFILES = {
+    "coding": 3.0,    # JSON-heavy tool results, structured output
+    "balanced": 3.4,  # mixed coding + prose (default)
+    "reading": 3.8,   # text-heavy, reading documents, philosophy
+}
+
+
 def _build_report(stats: dict, filepath: str) -> dict:
     """Build the context status report from raw stats."""
-    bpt = CFG["bytes_per_token"]
+    bpt = CFG["bytes_per_token"]  # configurable override, used as balanced default
 
     # If Codex with native token counts, use those directly
     if stats.get("has_native_counts"):
@@ -694,14 +705,14 @@ def _build_report(stats: dict, filepath: str) -> dict:
         usage_pct = round((total_tokens / CFG["context_window"]) * 100, 1)
     compact_pct = round((total_tokens / effective_ceiling) * 100, 1) if effective_ceiling > 0 else 0
 
-    if compact_pct >= THRESHOLD_IMMINENT:
-        status = "CRITICAL"
-    elif compact_pct >= THRESHOLD_SOON:
-        status = "HIGH"
-    elif compact_pct >= 50:
-        status = "MODERATE"
+    if compact_pct >= PHASE_THRESHOLD:
+        status = "threshold"
+    elif compact_pct >= PHASE_NARROWING:
+        status = "narrowing"
+    elif compact_pct >= PHASE_MIDSTREAM:
+        status = "midstream"
     else:
-        status = "OK"
+        status = "open"
 
     report = {
         "status": status,
@@ -730,13 +741,7 @@ def _build_report(stats: dict, filepath: str) -> dict:
         }
     else:
         report["breakdown"] = {
-            "dynamic_content_tokens": int((
-                stats["text_bytes"]
-                + stats["tool_use_bytes"]
-                + stats["tool_result_bytes"]
-                + stats["system_bytes"]
-                + stats["compaction_summary_bytes"]
-            ) / bpt),
+            "dynamic_content_tokens": int(in_context_bytes / bpt),
             "static_overhead_tokens": CFG["static_overhead"],
             "text_tokens": int(stats["text_bytes"] / bpt),
             "tool_use_tokens": int(stats["tool_use_bytes"] / bpt),
@@ -745,6 +750,18 @@ def _build_report(stats: dict, filepath: str) -> dict:
             "compaction_summary_tokens": int(stats["compaction_summary_bytes"] / bpt),
             "thinking_tokens_excluded": int(stats["thinking_bytes"] / bpt),
         }
+
+    # Add session profile estimates (coding/balanced/reading) for Claude Code
+    if not stats.get("has_native_counts"):
+        profiles = {}
+        for profile_name, profile_bpt in BPT_PROFILES.items():
+            profile_dynamic = int(in_context_bytes / profile_bpt)
+            profile_total = profile_dynamic + CFG["static_overhead"]
+            profile_compact = int(
+                (profile_total / effective_ceiling) * 100
+            ) if effective_ceiling > 0 else 0
+            profiles[profile_name] = profile_compact
+        report["profiles"] = profiles
 
     return report
 
@@ -775,8 +792,10 @@ mcp = FastMCP(
         "Context window usage monitor. Call context_status() to check how "
         "close you are to context compaction. Use this to self-manage: write "
         "key insights to persistent storage (memory queue, documents) before "
-        "compaction erases them. Status levels: OK (<50%), MODERATE (50-75%), "
-        "HIGH (75-90%, start saving state), CRITICAL (>90%, save NOW). "
+        "compaction erases them. Phases: open (<50%), midstream (50-80%), "
+        "narrowing (80-92%, start choosing what to carry), threshold (>92%, "
+        "write what matters now). Profiles show estimates for different session "
+        "types (coding/balanced/reading). "
         "Optionally pass transcript_path to target a specific session file."
     ),
 )
@@ -786,10 +805,10 @@ mcp = FastMCP(
     name="context_status",
     description=(
         "Estimate current context window usage and distance to compaction. "
-        "Returns status (OK/MODERATE/HIGH/CRITICAL), usage percentages, "
-        "token estimates. Use this to self-manage: "
-        "OK (<50%), MODERATE (50-75%), HIGH (75-90%, start saving state), "
-        "CRITICAL (>90%, save NOW). "
+        "Returns phase (open/midstream/narrowing/threshold), token estimates, "
+        "and profile range (coding/balanced/reading). Use this to self-manage: "
+        "open (<50%), midstream (50-80%), narrowing (80-92%, start choosing "
+        "what to carry), threshold (>92%, write what matters now). "
         "Optionally pass transcript_path to target a specific session file."
     ),
 )
@@ -860,11 +879,14 @@ def context_status_tool(transcript_path: Optional[str] = None) -> dict:
 
     result = {
         "status": report["status"],
-        "percent_till_autocompact": report["compaction_percent"],
         "estimated_tokens_used": report["estimated_tokens_used"],
         "estimated_tokens_remaining": report["estimated_tokens_remaining"],
         "_nonce": _SESSION_NONCE,
     }
+
+    # Add profile range if available (coding/balanced/reading estimates)
+    if "profiles" in report:
+        result["percent_till_autocompact"] = report["profiles"]
 
     if not _TRANSCRIPT_CONFIRMED and not transcript_path:
         result["_note"] = "unconfirmed — will self-correct on next call"
