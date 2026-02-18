@@ -39,7 +39,7 @@ BACKEND_DEFAULTS = {
         "context_window": 200_000,
         "autocompact_buffer": 33_000,
         "static_overhead": 43_500,
-        "bytes_per_token": 3.2,
+        "bytes_per_token": 3.4,
         "transcript_dir": "~/.claude/projects",
         "state_dir": "~/.claude",
         "compaction_marker": "continued from a previous conversation that ran out of context",
