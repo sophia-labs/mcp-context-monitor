@@ -260,6 +260,8 @@ if CFG["backend"] == "codex-cli":
 else:
     _PROJECT_DIR = _find_project_dir_claude()
 
+_TRANSCRIPT_PATH: str | None = None  # detected on first call, then locked in
+
 print(f"[context-monitor] Backend: {CFG['backend']}", file=sys.stderr)
 if _PROJECT_DIR:
     print(f"[context-monitor] Project dir: {_PROJECT_DIR}", file=sys.stderr)
@@ -748,10 +750,15 @@ mcp = FastMCP(
 )
 def context_status_tool(transcript_path: Optional[str] = None) -> dict:
     """Estimate context window usage from the session transcript."""
-    # Find transcript fresh each call — the current session's JSONL is always
-    # the most recently modified by the time this tool executes, since the
-    # tool_use message was already written to it before we run.
-    filepath = transcript_path or _find_transcript(_PROJECT_DIR)
+    # Detect transcript on first call, then lock in. Can't detect at startup
+    # because the session JSONL doesn't exist yet when MCP servers start.
+    # By first call, the current session's file exists and is most recent.
+    global _TRANSCRIPT_PATH
+    if _TRANSCRIPT_PATH is None:
+        _TRANSCRIPT_PATH = _find_transcript(_PROJECT_DIR)
+        if _TRANSCRIPT_PATH:
+            print(f"[context-monitor] Tracking: {os.path.basename(_TRANSCRIPT_PATH)}", file=sys.stderr)
+    filepath = transcript_path or _TRANSCRIPT_PATH
 
     if not filepath or not os.path.exists(filepath):
         return {
