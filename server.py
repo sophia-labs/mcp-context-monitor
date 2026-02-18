@@ -59,7 +59,7 @@ BACKEND_DEFAULTS = {
         "transcript_dir": "~/.codex/sessions",
         "state_dir": "~/.codex",
         "use_native_token_counts": True,  # Codex embeds token counts in turn events
-        "transcript_pattern": "*.jsonl",
+        "transcript_pattern": "**/*.jsonl",  # Codex nests in YYYY/MM/DD subdirs
         "skip_prefix": "",
         "format": "codex",
     },
@@ -241,7 +241,8 @@ def _find_transcript(project_dir: str | None) -> str | None:
         return None
 
     candidates = []
-    for f in glob(os.path.join(project_dir, CFG["transcript_pattern"])):
+    pattern = os.path.join(project_dir, CFG["transcript_pattern"])
+    for f in glob(pattern, recursive=True):
         basename = os.path.basename(f)
         if CFG["skip_prefix"] and basename.startswith(CFG["skip_prefix"]):
             continue
@@ -460,9 +461,10 @@ def _estimate_usage_claude(filepath: str, compaction_offset: int, sidecar: dict)
 def _find_last_compaction_codex(filepath: str, sidecar: dict) -> tuple[int, dict]:
     """Find byte offset of last compaction in a Codex CLI transcript.
 
-    Codex compaction produces an opaque encrypted item. We look for
-    event records that indicate compaction occurred. The exact format
-    depends on the Codex version — this handles known patterns.
+    Codex compaction events have top-level type: "compacted".
+    However, since we use native token counts from token_count events
+    (which already reflect post-compaction state), compaction detection
+    is only used for activity counting, not for token estimation.
     """
     file_size = os.path.getsize(filepath)
 
@@ -483,19 +485,10 @@ def _find_last_compaction_codex(filepath: str, sidecar: dict) -> tuple[int, dict
             f.seek(start_scan)
 
         for line in f:
-            # Codex compaction markers: look for compaction-related event types
-            if b'"compact"' in line or b'"compaction"' in line or b'"compacted"' in line:
+            if b'"compacted"' in line:
                 try:
                     obj = json.loads(line)
-                    # Check for known compaction event patterns
-                    event_type = ""
-                    if isinstance(obj, dict):
-                        event_type = obj.get("type", "")
-                        msg = obj.get("msg", {})
-                        if isinstance(msg, dict):
-                            event_type = event_type or msg.get("type", "")
-
-                    if "compact" in event_type.lower():
+                    if isinstance(obj, dict) and obj.get("type") == "compacted":
                         last_compaction_offset = current_offset
                 except json.JSONDecodeError:
                     pass
@@ -512,30 +505,39 @@ def _find_last_compaction_codex(filepath: str, sidecar: dict) -> tuple[int, dict
 def _estimate_usage_codex(filepath: str, compaction_offset: int, sidecar: dict) -> tuple[dict, dict]:
     """Parse Codex CLI transcript and estimate token usage.
 
-    Codex transcripts include native token counts in turn.completed events,
-    so we can use those directly instead of estimating from byte counts.
+    Codex transcripts include native token counts in token_count events
+    (type: "event_msg", payload.type: "token_count"). The key fields:
+      - payload.info.last_token_usage.input_tokens = current turn's context size
+      - payload.info.model_context_window = effective ceiling (258400)
+
+    Since last_token_usage already reflects post-compaction state, we don't
+    need compaction boundary detection for token estimation — we just need
+    the most recent token_count event with info set.
     """
     file_size = os.path.getsize(filepath)
 
+    # For Codex, we always scan the whole file (or from cache) to find
+    # the latest token_count event. Compaction offset isn't used for
+    # token estimation since native counts handle it.
     cached_path = sidecar.get("transcript_path")
-    cached_compaction = sidecar.get("last_compaction_offset", 0)
     cached_scan_end = sidecar.get("last_stats_scan_offset", 0)
     cached_stats = sidecar.get("running_stats")
 
     if (cached_path == filepath
-            and cached_compaction == compaction_offset
             and cached_stats is not None
-            and cached_scan_end > compaction_offset
             and cached_scan_end <= file_size):
         scan_from = cached_scan_end
         stats = dict(cached_stats)
     else:
-        scan_from = compaction_offset
+        scan_from = 0
         stats = _empty_stats()
         stats["native_input_tokens"] = 0
         stats["native_output_tokens"] = 0
         stats["native_cached_tokens"] = 0
+        stats["native_reasoning_tokens"] = 0
+        stats["model_context_window"] = 0
         stats["has_native_counts"] = False
+        stats["compaction_count"] = 0
 
     with open(filepath, "rb") as f:
         f.seek(scan_from)
@@ -550,63 +552,44 @@ def _estimate_usage_codex(filepath: str, compaction_offset: int, sidecar: dict) 
             except json.JSONDecodeError:
                 continue
 
-            stats["entry_count"] += 1
-
             if not isinstance(obj, dict):
-                stats["metadata_bytes"] += len(line)
                 continue
 
+            stats["entry_count"] += 1
             record_type = obj.get("type", "")
 
-            # Handle turn.completed events with native token counts
+            # Native token counts from token_count events
             if record_type == "event_msg":
-                msg = obj.get("msg", {})
-                if isinstance(msg, dict) and msg.get("type") == "turn_complete":
-                    usage = msg.get("usage", {})
-                    if usage:
-                        stats["has_native_counts"] = True
-                        # These are cumulative per-turn, take the latest
-                        stats["native_input_tokens"] = usage.get("input_tokens", 0)
-                        stats["native_cached_tokens"] = usage.get("cached_input_tokens", 0)
-                        stats["native_output_tokens"] = usage.get("output_tokens", 0)
+                payload = obj.get("payload", {})
+                if isinstance(payload, dict) and payload.get("type") == "token_count":
+                    info = payload.get("info")
+                    if isinstance(info, dict):
+                        last_usage = info.get("last_token_usage", {})
+                        if last_usage:
+                            stats["has_native_counts"] = True
+                            stats["native_input_tokens"] = last_usage.get("input_tokens", 0)
+                            stats["native_cached_tokens"] = last_usage.get("cached_input_tokens", 0)
+                            stats["native_output_tokens"] = last_usage.get("output_tokens", 0)
+                            stats["native_reasoning_tokens"] = last_usage.get("reasoning_output_tokens", 0)
+                        mcw = info.get("model_context_window")
+                        if mcw:
+                            stats["model_context_window"] = mcw
+                elif isinstance(payload, dict) and payload.get("type") == "task_complete":
+                    stats["assistant_message_count"] += 1
+                elif isinstance(payload, dict) and payload.get("type") == "task_started":
+                    stats["user_message_count"] += 1
 
-            # Handle response items (messages, tool calls, etc.)
+            # Compaction events
+            elif record_type == "compacted":
+                stats["compaction_count"] = stats.get("compaction_count", 0) + 1
+
+            # Response items for activity counting
             elif record_type == "response_item":
-                item = obj.get("item", {})
-                if not isinstance(item, dict):
-                    continue
-
-                item_type = item.get("type", "")
-                role = item.get("role", "")
-                item_bytes = len(json.dumps(item).encode("utf-8"))
-
-                if item_type == "function_call" or item_type == "tool_call":
-                    stats["tool_use_bytes"] += item_bytes
-                    stats["tool_call_count"] += 1
-                elif item_type == "function_call_output" or item_type == "tool_result":
-                    stats["tool_result_bytes"] += item_bytes
-                elif item_type == "message":
-                    if role == "user":
-                        stats["user_message_count"] += 1
-                        stats["text_bytes"] += item_bytes
-                    elif role == "assistant":
-                        stats["assistant_message_count"] += 1
-                        # Check for reasoning/thinking content
-                        content = item.get("content", [])
-                        if isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "reasoning":
-                                    stats["thinking_bytes"] += len(json.dumps(block).encode("utf-8"))
-                                else:
-                                    stats["text_bytes"] += len(json.dumps(block).encode("utf-8"))
-                        else:
-                            stats["text_bytes"] += item_bytes
-                    else:
-                        stats["text_bytes"] += item_bytes
-                else:
-                    stats["metadata_bytes"] += len(line)
-            else:
-                stats["metadata_bytes"] += len(line)
+                payload = obj.get("payload", {})
+                if isinstance(payload, dict):
+                    item_type = payload.get("type", "")
+                    if item_type == "function_call":
+                        stats["tool_call_count"] += 1
 
     sidecar["last_stats_scan_offset"] = file_size
     sidecar["running_stats"] = stats
@@ -640,12 +623,13 @@ def _build_report(stats: dict, filepath: str) -> dict:
 
     # If Codex with native token counts, use those directly
     if stats.get("has_native_counts"):
-        # native_input_tokens is the total context at the last turn
-        dynamic_tokens = stats["native_input_tokens"]
-        # No need to add static overhead — native counts include everything
-        total_tokens = dynamic_tokens
+        # native_input_tokens = last_token_usage.input_tokens = current context size
+        total_tokens = stats["native_input_tokens"]
+        # Use model_context_window from the event if available (more accurate
+        # than config since it comes directly from the server)
+        effective_ceiling = stats.get("model_context_window") or CFG["effective_ceiling"]
     else:
-        # Estimate from byte counts
+        # Estimate from byte counts (Claude Code path)
         in_context_bytes = (
             stats["text_bytes"]
             + stats["tool_use_bytes"]
@@ -655,10 +639,14 @@ def _build_report(stats: dict, filepath: str) -> dict:
         )
         dynamic_tokens = int(in_context_bytes / bpt)
         total_tokens = dynamic_tokens + CFG["static_overhead"]
+        effective_ceiling = CFG["effective_ceiling"]
 
-    effective_ceiling = CFG["effective_ceiling"]
     remaining = max(0, effective_ceiling - total_tokens)
-    usage_pct = round((total_tokens / CFG["context_window"]) * 100, 1)
+    if stats.get("has_native_counts"):
+        # For Codex, model_context_window IS the effective ceiling
+        usage_pct = round((total_tokens / effective_ceiling) * 100, 1) if effective_ceiling > 0 else 0
+    else:
+        usage_pct = round((total_tokens / CFG["context_window"]) * 100, 1)
     compact_pct = round((total_tokens / effective_ceiling) * 100, 1) if effective_ceiling > 0 else 0
 
     if compact_pct >= THRESHOLD_IMMINENT:
@@ -670,7 +658,7 @@ def _build_report(stats: dict, filepath: str) -> dict:
     else:
         status = "OK"
 
-    return {
+    report = {
         "status": status,
         "usage_percent": usage_pct,
         "compaction_percent": compact_pct,
@@ -678,16 +666,6 @@ def _build_report(stats: dict, filepath: str) -> dict:
         "estimated_tokens_remaining": remaining,
         "effective_ceiling": effective_ceiling,
         "backend": CFG["backend"],
-        "breakdown": {
-            "dynamic_content_tokens": dynamic_tokens,
-            "static_overhead_tokens": CFG["static_overhead"] if not stats.get("has_native_counts") else 0,
-            "text_tokens": int(stats["text_bytes"] / bpt),
-            "tool_use_tokens": int(stats["tool_use_bytes"] / bpt),
-            "tool_result_tokens": int(stats["tool_result_bytes"] / bpt),
-            "system_tokens": int(stats["system_bytes"] / bpt),
-            "compaction_summary_tokens": int(stats["compaction_summary_bytes"] / bpt),
-            "thinking_tokens_excluded": int(stats["thinking_bytes"] / bpt),
-        },
         "activity": {
             "entries": stats["entry_count"],
             "user_messages": stats["user_message_count"],
@@ -696,6 +674,34 @@ def _build_report(stats: dict, filepath: str) -> dict:
         },
         "transcript": os.path.basename(filepath),
     }
+
+    if stats.get("has_native_counts"):
+        report["breakdown"] = {
+            "input_tokens": stats["native_input_tokens"],
+            "cached_tokens": stats["native_cached_tokens"],
+            "output_tokens": stats["native_output_tokens"],
+            "reasoning_tokens": stats["native_reasoning_tokens"],
+            "compactions": stats.get("compaction_count", 0),
+        }
+    else:
+        report["breakdown"] = {
+            "dynamic_content_tokens": int((
+                stats["text_bytes"]
+                + stats["tool_use_bytes"]
+                + stats["tool_result_bytes"]
+                + stats["system_bytes"]
+                + stats["compaction_summary_bytes"]
+            ) / bpt),
+            "static_overhead_tokens": CFG["static_overhead"],
+            "text_tokens": int(stats["text_bytes"] / bpt),
+            "tool_use_tokens": int(stats["tool_use_bytes"] / bpt),
+            "tool_result_tokens": int(stats["tool_result_bytes"] / bpt),
+            "system_tokens": int(stats["system_bytes"] / bpt),
+            "compaction_summary_tokens": int(stats["compaction_summary_bytes"] / bpt),
+            "thinking_tokens_excluded": int(stats["thinking_bytes"] / bpt),
+        }
+
+    return report
 
 
 # ---------------------------------------------------------------------------
