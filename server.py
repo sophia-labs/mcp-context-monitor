@@ -11,9 +11,10 @@ Configuration (loaded in order, later overrides earlier):
   3. Environment variables: CONTEXT_MONITOR_*
 
 Transcript detection:
-  The server detects the active transcript ONCE at startup (most recently
-  modified .jsonl in the project/session directory). Since each MCP server
-  lives exactly as long as its host session, this avoids race conditions.
+  Multi-agent safe. Each MCP server instance embeds a unique nonce in its
+  first response. On the second call, it scans candidate transcripts for
+  that nonce to identify which JSONL belongs to this session. The first
+  call uses mtime as a best guess; subsequent calls are confirmed.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import json
 import os
 import sys
 import tomllib
+import uuid
 from glob import glob
 from pathlib import Path
 from typing import Optional
@@ -230,15 +232,10 @@ def _find_project_dir_codex() -> str | None:
     return None
 
 
-def _find_transcript(project_dir: str | None) -> str | None:
-    """Find the most recently modified transcript."""
-    # Explicit override
-    explicit = CFG.get("transcript_path") or os.environ.get("CONTEXT_MONITOR_TRANSCRIPT")
-    if explicit:
-        return explicit
-
+def _get_candidates(project_dir: str | None) -> list[str]:
+    """Get all candidate transcript files in the project directory."""
     if not project_dir or not os.path.isdir(project_dir):
-        return None
+        return []
 
     candidates = []
     pattern = os.path.join(project_dir, CFG["transcript_pattern"])
@@ -247,11 +244,44 @@ def _find_transcript(project_dir: str | None) -> str | None:
         if CFG["skip_prefix"] and basename.startswith(CFG["skip_prefix"]):
             continue
         candidates.append(f)
+    return candidates
 
+
+def _find_transcript_by_mtime(project_dir: str | None) -> str | None:
+    """Find transcript by most recent modification time (best guess)."""
+    explicit = CFG.get("transcript_path") or os.environ.get("CONTEXT_MONITOR_TRANSCRIPT")
+    if explicit:
+        return explicit
+
+    candidates = _get_candidates(project_dir)
     if not candidates:
         return None
 
     return max(candidates, key=os.path.getmtime)
+
+
+def _find_transcript_by_nonce(project_dir: str | None, nonce: str) -> str | None:
+    """Scan candidate transcripts for our unique nonce to confirm identity.
+
+    The nonce was included in a previous context_status() response, which
+    the host CLI wrote to its JSONL transcript. Finding it confirms which
+    transcript belongs to this MCP server instance.
+    """
+    candidates = _get_candidates(project_dir)
+    nonce_bytes = nonce.encode("utf-8")
+
+    for f in candidates:
+        try:
+            size = os.path.getsize(f)
+            with open(f, "rb") as fh:
+                # Nonce should be in a recent tool result — check last 200KB
+                fh.seek(max(0, size - 200_000))
+                tail = fh.read()
+                if nonce_bytes in tail:
+                    return f
+        except OSError:
+            continue
+    return None
 
 
 # Detect project dir at startup (stable — based on CWD)
@@ -260,9 +290,15 @@ if CFG["backend"] == "codex-cli":
 else:
     _PROJECT_DIR = _find_project_dir_claude()
 
-_TRANSCRIPT_PATH: str | None = None  # detected on first call, then locked in
+# Session identity: unique nonce per MCP server instance
+_SESSION_NONCE = str(uuid.uuid4())
+_TRANSCRIPT_PATH: str | None = None  # set on first call
+_TRANSCRIPT_CONFIRMED = False  # True once nonce-confirmed
+_NONCE_SCAN_ATTEMPTS = 0
+_MAX_NONCE_SCANS = 5  # stop scanning after this many failed attempts
 
 print(f"[context-monitor] Backend: {CFG['backend']}", file=sys.stderr)
+print(f"[context-monitor] Nonce: {_SESSION_NONCE[:8]}...", file=sys.stderr)
 if _PROJECT_DIR:
     print(f"[context-monitor] Project dir: {_PROJECT_DIR}", file=sys.stderr)
 else:
@@ -273,20 +309,29 @@ else:
 # Sidecar state (incremental scanning)
 # ---------------------------------------------------------------------------
 
-def _read_sidecar() -> dict:
-    if SIDECAR_FILE.exists():
+def _sidecar_path_for(transcript: str) -> Path:
+    """Per-transcript sidecar file to prevent cache thrashing between agents."""
+    # Use transcript basename (UUID.jsonl) as the sidecar key
+    name = Path(transcript).stem  # e.g. "482fdb35-b3d1-4862-ae4f-15990c4fbea7"
+    return SIDECAR_DIR / f"context-monitor-{name}.json"
+
+
+def _read_sidecar(transcript: str | None = None) -> dict:
+    sidecar_file = _sidecar_path_for(transcript) if transcript else SIDECAR_FILE
+    if sidecar_file.exists():
         try:
-            return json.loads(SIDECAR_FILE.read_text())
+            return json.loads(sidecar_file.read_text())
         except (json.JSONDecodeError, OSError):
             pass
     return {}
 
 
-def _write_sidecar(state: dict) -> None:
+def _write_sidecar(state: dict, transcript: str | None = None) -> None:
+    sidecar_file = _sidecar_path_for(transcript) if transcript else SIDECAR_FILE
     SIDECAR_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = SIDECAR_FILE.with_suffix(".tmp")
+    tmp = sidecar_file.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2))
-    tmp.rename(SIDECAR_FILE)
+    tmp.rename(sidecar_file)
 
 
 # ---------------------------------------------------------------------------
@@ -750,15 +795,48 @@ mcp = FastMCP(
 )
 def context_status_tool(transcript_path: Optional[str] = None) -> dict:
     """Estimate context window usage from the session transcript."""
-    # Detect transcript on first call, then lock in. Can't detect at startup
-    # because the session JSONL doesn't exist yet when MCP servers start.
-    # By first call, the current session's file exists and is most recent.
-    global _TRANSCRIPT_PATH
-    if _TRANSCRIPT_PATH is None:
-        _TRANSCRIPT_PATH = _find_transcript(_PROJECT_DIR)
-        if _TRANSCRIPT_PATH:
-            print(f"[context-monitor] Tracking: {os.path.basename(_TRANSCRIPT_PATH)}", file=sys.stderr)
-    filepath = transcript_path or _TRANSCRIPT_PATH
+    global _TRANSCRIPT_PATH, _TRANSCRIPT_CONFIRMED, _NONCE_SCAN_ATTEMPTS
+
+    # --- Transcript identification ---
+    # Phase 1 (first call): best guess via mtime, embed nonce in response
+    # Phase 2 (second+ calls): scan for nonce to confirm the right transcript
+    if transcript_path:
+        filepath = transcript_path
+    elif _TRANSCRIPT_CONFIRMED:
+        filepath = _TRANSCRIPT_PATH
+    else:
+        # Try nonce confirmation if we have a previous guess
+        if _TRANSCRIPT_PATH is not None and _NONCE_SCAN_ATTEMPTS < _MAX_NONCE_SCANS:
+            _NONCE_SCAN_ATTEMPTS += 1
+            confirmed = _find_transcript_by_nonce(_PROJECT_DIR, _SESSION_NONCE)
+            if confirmed:
+                if confirmed != _TRANSCRIPT_PATH:
+                    print(
+                        f"[context-monitor] Nonce corrected: "
+                        f"{os.path.basename(_TRANSCRIPT_PATH)} -> "
+                        f"{os.path.basename(confirmed)}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"[context-monitor] Nonce confirmed: "
+                        f"{os.path.basename(confirmed)}",
+                        file=sys.stderr,
+                    )
+                _TRANSCRIPT_PATH = confirmed
+                _TRANSCRIPT_CONFIRMED = True
+
+        # First call: mtime best guess
+        if _TRANSCRIPT_PATH is None:
+            _TRANSCRIPT_PATH = _find_transcript_by_mtime(_PROJECT_DIR)
+            if _TRANSCRIPT_PATH:
+                print(
+                    f"[context-monitor] Initial guess: "
+                    f"{os.path.basename(_TRANSCRIPT_PATH)}",
+                    file=sys.stderr,
+                )
+
+        filepath = _TRANSCRIPT_PATH
 
     if not filepath or not os.path.exists(filepath):
         return {
@@ -768,24 +846,31 @@ def context_status_tool(transcript_path: Optional[str] = None) -> dict:
                 "CONTEXT_MONITOR_PROJECT_DIR, or create a config file at "
                 f"{CONFIG_PATH}"
             ),
+            "_nonce": _SESSION_NONCE,
         }
 
-    sidecar = _read_sidecar()
+    sidecar = _read_sidecar(filepath)
 
     compaction_offset, sidecar = _find_compaction(filepath, sidecar)
     stats, sidecar = _estimate(filepath, compaction_offset, sidecar)
 
-    _write_sidecar(sidecar)
+    _write_sidecar(sidecar, filepath)
 
     report = _build_report(stats, filepath)
 
-    return {
+    result = {
         "status": report["status"],
         "usage_percent": report["usage_percent"],
         "compaction_percent": report["compaction_percent"],
         "estimated_tokens_used": report["estimated_tokens_used"],
         "estimated_tokens_remaining": report["estimated_tokens_remaining"],
+        "_nonce": _SESSION_NONCE,
     }
+
+    if not _TRANSCRIPT_CONFIRMED and not transcript_path:
+        result["_note"] = "unconfirmed — will self-correct on next call"
+
+    return result
 
 
 if __name__ == "__main__":
