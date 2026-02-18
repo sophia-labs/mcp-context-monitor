@@ -254,19 +254,17 @@ def _find_transcript(project_dir: str | None) -> str | None:
     return max(candidates, key=os.path.getmtime)
 
 
-# Detect once at startup
+# Detect project dir at startup (stable — based on CWD)
 if CFG["backend"] == "codex-cli":
     _PROJECT_DIR = _find_project_dir_codex()
 else:
     _PROJECT_DIR = _find_project_dir_claude()
 
-_TRANSCRIPT_PATH = _find_transcript(_PROJECT_DIR)
-
 print(f"[context-monitor] Backend: {CFG['backend']}", file=sys.stderr)
-if _TRANSCRIPT_PATH:
-    print(f"[context-monitor] Tracking: {os.path.basename(_TRANSCRIPT_PATH)}", file=sys.stderr)
+if _PROJECT_DIR:
+    print(f"[context-monitor] Project dir: {_PROJECT_DIR}", file=sys.stderr)
 else:
-    print("[context-monitor] WARNING: No transcript found.", file=sys.stderr)
+    print("[context-monitor] WARNING: No project directory found.", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +748,10 @@ mcp = FastMCP(
 )
 def context_status_tool(transcript_path: Optional[str] = None) -> dict:
     """Estimate context window usage from the session transcript."""
-    filepath = transcript_path or _TRANSCRIPT_PATH
+    # Find transcript fresh each call — the current session's JSONL is always
+    # the most recently modified by the time this tool executes, since the
+    # tool_use message was already written to it before we run.
+    filepath = transcript_path or _find_transcript(_PROJECT_DIR)
 
     if not filepath or not os.path.exists(filepath):
         return {
