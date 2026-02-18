@@ -860,8 +860,7 @@ def context_status_tool(transcript_path: Optional[str] = None) -> dict:
 
     result = {
         "status": report["status"],
-        "usage_percent": report["usage_percent"],
-        "compaction_percent": report["compaction_percent"],
+        "percent_till_autocompact": report["compaction_percent"],
         "estimated_tokens_used": report["estimated_tokens_used"],
         "estimated_tokens_remaining": report["estimated_tokens_remaining"],
         "_nonce": _SESSION_NONCE,
