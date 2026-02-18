@@ -1,0 +1,8 @@
+[project]
+name = "mcp-context-monitor"
+version = "0.1.0"
+description = "Context window usage estimation for AI coding agents via MCP"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0",
+]
