@@ -39,7 +39,7 @@ BACKEND_DEFAULTS = {
         "context_window": 200_000,
         "autocompact_buffer": 33_000,
         "static_overhead": 43_500,
-        "bytes_per_token": 3.4,
+        "bytes_per_token": 3.3,
         "transcript_dir": "~/.claude/projects",
         "state_dir": "~/.claude",
         "compaction_marker": "continued from a previous conversation that ran out of context",
@@ -667,8 +667,8 @@ def _empty_stats() -> dict:
 # Coding sessions have more JSON tool results (lower BPT), reading sessions
 # have more natural language (higher BPT). The balanced value splits the diff.
 BPT_PROFILES = {
-    "coding": 3.0,    # JSON-heavy tool results, structured output
-    "balanced": 3.4,  # mixed coding + prose (default)
+    "coding": 2.9,    # JSON-heavy tool results, structured output
+    "balanced": 3.3,  # mixed coding + prose (default)
     "reading": 3.8,   # text-heavy, reading documents, philosophy
 }
 
