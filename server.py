@@ -881,6 +881,7 @@ def context_status_tool(transcript_path: Optional[str] = None) -> dict:
         "status": report["status"],
         "estimated_tokens_used": report["estimated_tokens_used"],
         "estimated_tokens_remaining": report["estimated_tokens_remaining"],
+        "transcript_path": filepath,
         "_nonce": _SESSION_NONCE,
     }
 
